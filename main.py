@@ -98,9 +98,6 @@ try:
 except Exception as e:
     print("Conversion failed:", e)
 
-print("Length of tflite_model:", len(tflite_model))
-print("Saved file exists:", os.path.exists("autoencoder_model.tflite"))
-
 # Save the TFLite model
 with open('autoencoder_model.tflite', 'wb') as f:
     f.write(tflite_model)
