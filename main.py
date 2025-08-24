@@ -70,8 +70,8 @@ axes[1].axis('off')
 plt.show()
 
 # Save the model in TensorFlow SavedModel format
-model.save('autoencoder_saved_model')
-print("Model saved in TensorFlow SavedModel format at 'autoencoder_saved_model'")
+model.save('autoencoder_saved_model.keras')
+print("Model saved in TensorFlow SavedModel format at 'autoencoder_saved_model.keras'")
 
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
 try:
