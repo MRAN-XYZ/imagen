@@ -91,7 +91,12 @@ plt.show()
 
 # Convert the model to TensorFlow Lite
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
-tflite_model = converter.convert()
+
+try:
+    tflite_model = converter.convert()
+    print("Conversion success, model size:", len(tflite_model))
+except Exception as e:
+    print("Conversion failed:", e)
 
 print("Length of tflite_model:", len(tflite_model))
 print("Saved file exists:", os.path.exists("autoencoder_model.tflite"))
