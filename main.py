@@ -44,7 +44,7 @@ train_generator = datagen.flow_from_directory(
 
 # Optional: Validation generator if using validation_split
 validation_generator = datagen.flow_from_directory(
-    'path/to/your/dataset',
+    './Logos',
     target_size=(150, 150),
     batch_size=32,
     class_mode='categorical',
