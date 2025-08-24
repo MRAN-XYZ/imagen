@@ -8,7 +8,7 @@ import os
 import glob
 
 # Path to your dataset folder
-dataset_path = 'Logos'  # Replace with the actual path if different, e.g., 'path/to/logos'
+dataset_path = '/content/imagen/Logos'  # Replace with the actual path if different, e.g., 'path/to/logos'
 
 # Load all images from the folder
 # Changed target_size to (128, 128) to ensure dimensions are compatible with the pooling/upsampling layers
