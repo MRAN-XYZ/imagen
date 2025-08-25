@@ -17,7 +17,7 @@ print(f"Using device: {device}")
 # ----------------------
 # Config
 # ----------------------
-data_path = "/content/dataset"   # 👈 your folder with 1400 imgs
+data_path = "/content/imagen/Logos"   # 👈 your folder with 1400 imgs
 latent_dim = 100
 batch_size = 64
 epochs = 50
