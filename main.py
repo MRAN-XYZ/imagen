@@ -72,13 +72,3 @@ plt.show()
 # Save the model in TensorFlow SavedModel format
 model.save('autoencoder_saved_model.keras')
 print("Model saved in TensorFlow SavedModel format at 'autoencoder_saved_model.keras'")
-
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
-try:
-    tflite_model = converter.convert()
-    print("Conversion success, model size:", len(tflite_model))
-    with open('autoencoder_model.tflite', 'wb') as f:
-        f.write(tflite_model)
-    print("Autoencoder model converted to TFLite and saved as 'autoencoder_model.tflite'")
-except Exception as e:
-    print("Conversion failed:", e)
