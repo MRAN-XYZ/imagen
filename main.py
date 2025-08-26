@@ -290,15 +290,17 @@ for epoch in range(start_epoch, num_epochs):
         if (i % 2 == 0):  # Only update D every other batch
             netD.zero_grad(set_to_none=True)
             
+            # Generate fake images for discriminator training
+            noise = torch.randn(b_size, nz, 1, 1, device=device) * 1.1
+            with torch.no_grad():  # Don't track gradients for generator during D training
+                fake = netG(noise)
+            
             if scaler is not None:
                 with torch.amp.autocast(device_type=device.type):
                     out_real = netD(real)
                     loss_real = criterion(out_real, label_real)
                     
-                    # Add more noise to latent space
-                    noise = torch.randn(b_size, nz, 1, 1, device=device) * 1.1
-                    fake = netG(noise)
-                    out_fake = netD(fake.detach())
+                    out_fake = netD(fake.detach())  # Detach to avoid backprop through generator
                     loss_fake = criterion(out_fake, label_fake)
                     
                     # Add gradient penalty
@@ -324,9 +326,7 @@ for epoch in range(start_epoch, num_epochs):
                 out_real = netD(real)
                 loss_real = criterion(out_real, label_real)
                 
-                noise = torch.randn(b_size, nz, 1, 1, device=device) * 1.1
-                fake = netG(noise)
-                out_fake = netD(fake.detach())
+                out_fake = netD(fake.detach())  # Detach to avoid backprop through generator
                 loss_fake = criterion(out_fake, label_fake)
                 
                 # Add gradient penalty
@@ -350,6 +350,10 @@ for epoch in range(start_epoch, num_epochs):
 
         # ---------------- G ----------------
         netG.zero_grad(set_to_none=True)
+        
+        # Generate new fake images for generator training
+        noise = torch.randn(b_size, nz, 1, 1, device=device) * 1.1
+        fake = netG(noise)
         
         if scaler is not None:
             with torch.amp.autocast(device_type=device.type):
