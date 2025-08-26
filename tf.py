@@ -1,7 +1,6 @@
 # =========================================================
 # DCGAN (TensorFlow) on Colab TPU with EMA + Checkpointing
 # =========================================================
-!pip -q install tensorflow~=2.15.0  # or the TF your Colab already has
 
 import os, glob, math, time
 import numpy as np
