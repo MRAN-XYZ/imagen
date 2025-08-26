@@ -25,7 +25,7 @@ lr = 0.0002
 beta1 = 0.5
 beta2 = 0.999
 checkpoint_dir = "./checkpoints"
-dataset_path = "./dataset"   # <--- Tweak this path
+dataset_path = "/content/imagen/Logos"   # <--- Tweak this path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
