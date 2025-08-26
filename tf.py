@@ -1,366 +1,408 @@
-# =========================================================
-# DCGAN (TensorFlow) on Colab TPU with EMA + Checkpointing
-# =========================================================
-
-import os, glob, math, time
+import os
+import glob
 import numpy as np
-import tensorflow as tf
+from PIL import Image
+import jax
+import jax.numpy as jnp
+from jax import random, jit, value_and_grad, device_put
+import flax.linen as nn
+from flax.training import train_state
+import optax
+from functools import partial
 import matplotlib.pyplot as plt
+from typing import Any
+
+# Check TPU availability
+print(f"JAX devices: {jax.devices()}")
+print(f"JAX local devices: {jax.local_devices()}")
 
 # ------------------------------
-# Config
+# Simple Configuration
 # ------------------------------
+# Model params
 IMAGE_SIZE = 64
-NZ = 100        # latent dim
-NGF = 64        # generator features
-NDF = 64        # discriminator features
-NC = 3          # channels
-BATCH_SIZE = 64 # global batch size (TPU will split across 8 replicas)
+NZ = 100  # latent dim
+NGF = 64  # generator features
+NDF = 64  # discriminator features
+NC = 3    # color channels
+
+# Training params
+BATCH_SIZE = 64
 NUM_EPOCHS = 200
-LR = 2e-4
+LR = 0.0002
 BETA1, BETA2 = 0.5, 0.999
-LABEL_SMOOTH = 0.9          # real label smoothing
-SAMPLE_EVERY_EPOCHS = 10
-CHECKPOINT_DIR = "./checkpoints_tf"
-DATASET_PATH = "/content/imagen/Logos"  # <- point to your folder of images
+
+# Paths
+CHECKPOINT_DIR = "./checkpoints"
+DATASET_PATH = "/content/imagen/Logos"
+
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # ------------------------------
-# TPU init + mixed precision
+# Data Loading (NumPy-based for TPU)
 # ------------------------------
-print("TPU init…")
-try:
-    resolver = tf.distribute.cluster_resolver.TPUClusterResolver()  # auto-detect
-    tf.config.experimental_connect_to_cluster(resolver)
-    tf.tpu.experimental.initialize_tpu_system(resolver)
-    strategy = tf.distribute.TPUStrategy(resolver)
-    print("Running on TPU:", resolver.cluster_spec().as_dict()['worker'])
-except Exception as e:
-    print("TPU not found, falling back to CPU/GPU.", e)
-    strategy = tf.distribute.get_strategy()
-
-# TPU loves bfloat16
-from tensorflow.keras import mixed_precision
-mixed_precision.set_global_policy('mixed_bfloat16')
-
-# ------------------------------
-# Data pipeline
-# ------------------------------
-AUTOTUNE = tf.data.AUTOTUNE
-
-def list_image_files(root):
-    exts = ("*.jpg", "*.jpeg", "*.png")
+def load_dataset(root_path, image_size=64):
+    """Load and preprocess dataset into memory"""
+    extensions = ['*.jpg', '*.png', '*.jpeg']
     files = []
-    for ext in exts:
-        files.extend(glob.glob(os.path.join(root, ext)))
-    print(f"Found {len(files)} images.")
-    return files
+    for ext in extensions:
+        files.extend(glob.glob(os.path.join(root_path, ext)))
+    
+    print(f"Loading {len(files)} images...")
+    
+    data = []
+    for i, file_path in enumerate(files):
+        try:
+            img = Image.open(file_path).convert("RGB")
+            img = img.resize((image_size, image_size))
+            img_array = np.array(img, dtype=np.float32) / 127.5 - 1.0  # Normalize to [-1, 1]
+            data.append(img_array)
+            
+            if (i + 1) % 100 == 0:
+                print(f"Loaded {i + 1}/{len(files)} images")
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            continue
+    
+    data = np.stack(data, axis=0)
+    print(f"Dataset ready: {data.shape}")
+    return data
 
-def decode_and_preprocess(path):
-    img = tf.io.read_file(path)
-    img = tf.io.decode_image(img, channels=3, expand_animations=False)
-    img = tf.image.convert_image_dtype(img, tf.float32)  # [0,1]
-    img = tf.image.resize(img, [IMAGE_SIZE, IMAGE_SIZE], method='area')
-    img = tf.image.random_flip_left_right(img)
-    img = img * 2.0 - 1.0  # [-1, 1]
-    return img
+def get_batch(data, batch_size, rng):
+    """Get a random batch from the dataset"""
+    batch_indices = random.choice(rng, len(data), (batch_size,), replace=False)
+    return data[batch_indices]
 
-files = list_image_files(DATASET_PATH)
-if len(files) == 0:
-    raise ValueError("No images found. Please check DATASET_PATH.")
-
-ds = tf.data.Dataset.from_tensor_slices(files)
-ds = ds.shuffle(len(files), reshuffle_each_iteration=True)
-ds = ds.map(decode_and_preprocess, num_parallel_calls=AUTOTUNE)
-# Important for TPU: drop_remainder=True so each replica gets equal slices
-ds = ds.batch(BATCH_SIZE, drop_remainder=True)
-ds = ds.prefetch(AUTOTUNE)
-
-dist_ds = strategy.experimental_distribute_dataset(ds)
-
-# ------------------------------
-# Models (Keras)
-# ------------------------------
-from tensorflow.keras import layers, Model
-
-def make_generator():
-    # Input z: (None, NZ)
-    z = layers.Input(shape=(NZ,), dtype=tf.float32)
-    x = layers.Reshape((1, 1, NZ))(z)
-    x = layers.Conv2DTranspose(NGF*16, 4, strides=1, padding='valid', use_bias=False)(x)  # 4x4
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-
-    x = layers.Conv2DTranspose(NGF*8, 4, strides=2, padding='same', use_bias=False)(x)   # 8x8
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-
-    x = layers.Conv2DTranspose(NGF*4, 4, strides=2, padding='same', use_bias=False)(x)   # 16x16
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-
-    x = layers.Conv2DTranspose(NGF*2, 4, strides=2, padding='same', use_bias=False)(x)   # 32x32
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-
-    x = layers.Conv2DTranspose(NGF, 4, strides=2, padding='same', use_bias=False)(x)     # 64x64
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-
-    x = layers.Conv2DTranspose(NC, 3, strides=1, padding='same', use_bias=False)(x)
-    # Output in [-1, 1]
-    out = layers.Activation('tanh', dtype='float32')(x)  # cast to f32 for images
-    return Model(z, out, name="Generator")
-
-def make_discriminator():
-    inp = layers.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, NC), dtype=tf.float32)
-    x = layers.Conv2D(NDF, 4, strides=2, padding='same', use_bias=False)(inp)   # 32x32
-    x = layers.LeakyReLU(0.2)(x)
-
-    x = layers.Conv2D(NDF*2, 4, strides=2, padding='same', use_bias=False)(x)   # 16x16
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
-
-    x = layers.Conv2D(NDF*4, 4, strides=2, padding='same', use_bias=False)(x)   # 8x8
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
-
-    x = layers.Conv2D(NDF*8, 4, strides=2, padding='same', use_bias=False)(x)   # 4x4
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
-
-    x = layers.Conv2D(1, 4, strides=1, padding='valid', use_bias=False)(x)      # 1x1
-    x = layers.Flatten()(x)  # logits
-    # Keep logits in bf16/fp32 depending on policy, BCE will handle casting
-    return Model(inp, x, name="Discriminator")
-
-with strategy.scope():
-    netG = make_generator()
-    netD = make_discriminator()
-
-    bce = tf.keras.losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
-
-    optG = tf.keras.optimizers.Adam(learning_rate=LR, beta_1=BETA1, beta_2=BETA2)
-    optD = tf.keras.optimizers.Adam(learning_rate=LR * 0.5, beta_1=BETA1, beta_2=BETA2)  # match your PyTorch choice
-
-print(netG.summary())
-print(netD.summary())
+# Load dataset
+dataset = load_dataset(DATASET_PATH, IMAGE_SIZE)
 
 # ------------------------------
-# EMA for Generator (manual)
+# Models (Flax/Linen)
 # ------------------------------
-class EMA:
-    def __init__(self, model, decay=0.999):
+class Generator(nn.Module):
+    ngf: int = NGF
+    nc: int = NC
+    
+    @nn.compact
+    def __call__(self, x, training=True):
+        # x shape: (batch, nz, 1, 1)
+        
+        # 1x1 -> 4x4
+        x = nn.ConvTranspose(self.ngf * 16, kernel_size=(4, 4), strides=(1, 1), 
+                           padding='VALID', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        
+        # 4x4 -> 8x8
+        x = nn.ConvTranspose(self.ngf * 8, kernel_size=(4, 4), strides=(2, 2), 
+                           padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        
+        # 8x8 -> 16x16
+        x = nn.ConvTranspose(self.ngf * 4, kernel_size=(4, 4), strides=(2, 2), 
+                           padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        
+        # 16x16 -> 32x32
+        x = nn.ConvTranspose(self.ngf * 2, kernel_size=(4, 4), strides=(2, 2), 
+                           padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        
+        # 32x32 -> 64x64
+        x = nn.ConvTranspose(self.ngf, kernel_size=(4, 4), strides=(2, 2), 
+                           padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        
+        # Final layer
+        x = nn.ConvTranspose(self.nc, kernel_size=(3, 3), strides=(1, 1), 
+                           padding='SAME', use_bias=False)(x)
+        x = nn.tanh(x)
+        
+        return x
+
+class Discriminator(nn.Module):
+    ndf: int = NDF
+    nc: int = NC
+    
+    @nn.compact
+    def __call__(self, x, training=True):
+        # 64x64 -> 32x32
+        x = nn.Conv(self.ndf, kernel_size=(4, 4), strides=(2, 2), 
+                   padding='SAME', use_bias=False)(x)
+        x = nn.leaky_relu(x, negative_slope=0.2)
+        
+        # 32x32 -> 16x16
+        x = nn.Conv(self.ndf * 2, kernel_size=(4, 4), strides=(2, 2), 
+                   padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.leaky_relu(x, negative_slope=0.2)
+        
+        # 16x16 -> 8x8
+        x = nn.Conv(self.ndf * 4, kernel_size=(4, 4), strides=(2, 2), 
+                   padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.leaky_relu(x, negative_slope=0.2)
+        
+        # 8x8 -> 4x4
+        x = nn.Conv(self.ndf * 8, kernel_size=(4, 4), strides=(2, 2), 
+                   padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.leaky_relu(x, negative_slope=0.2)
+        
+        # 4x4 -> 1x1
+        x = nn.Conv(1, kernel_size=(4, 4), strides=(1, 1), 
+                   padding='VALID', use_bias=False)(x)
+        x = x.reshape(x.shape[0], -1)  # Flatten
+        
+        return x
+
+# ------------------------------
+# Training State and Functions
+# ------------------------------
+def create_train_state(rng, learning_rate, model, input_shape):
+    """Create initial training state"""
+    params = model.init(rng, jnp.ones(input_shape), training=True)['params']
+    tx = optax.adam(learning_rate, b1=BETA1, b2=BETA2)
+    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+
+def bce_with_logits_loss(logits, labels):
+    """Binary cross entropy with logits loss"""
+    return jnp.mean(optax.sigmoid_binary_cross_entropy(logits, labels))
+
+@jit
+def train_discriminator_step(d_state, g_state, real_batch, rng):
+    """Single discriminator training step"""
+    batch_size = real_batch.shape[0]
+    
+    def d_loss_fn(d_params):
+        # Real images loss
+        real_logits = d_state.apply_fn({'params': d_params}, real_batch, training=True)
+        real_labels = jnp.ones((batch_size, 1)) * 0.9  # Label smoothing
+        real_loss = bce_with_logits_loss(real_logits, real_labels)
+        
+        # Fake images loss
+        noise = random.normal(rng, (batch_size, NZ, 1, 1))
+        fake_batch = g_state.apply_fn({'params': g_state.params}, noise, training=False)
+        fake_logits = d_state.apply_fn({'params': d_params}, fake_batch, training=True)
+        fake_labels = jnp.zeros((batch_size, 1))
+        fake_loss = bce_with_logits_loss(fake_logits, fake_labels)
+        
+        return (real_loss + fake_loss) / 2
+    
+    loss, grads = value_and_grad(d_loss_fn)(d_state.params)
+    d_state = d_state.apply_gradients(grads=grads)
+    return d_state, loss
+
+@jit
+def train_generator_step(g_state, d_state, rng):
+    """Single generator training step"""
+    batch_size = BATCH_SIZE
+    
+    def g_loss_fn(g_params):
+        noise = random.normal(rng, (batch_size, NZ, 1, 1))
+        fake_batch = g_state.apply_fn({'params': g_params}, noise, training=True)
+        fake_logits = d_state.apply_fn({'params': d_state.params}, fake_batch, training=False)
+        real_labels = jnp.ones((batch_size, 1)) * 0.9  # Generator wants D to think fakes are real
+        return bce_with_logits_loss(fake_logits, real_labels)
+    
+    loss, grads = value_and_grad(g_loss_fn)(g_state.params)
+    g_state = g_state.apply_gradients(grads=grads)
+    return g_state, loss
+
+@jit
+def generate_samples(g_state, noise):
+    """Generate samples using the generator"""
+    return g_state.apply_fn({'params': g_state.params}, noise, training=False)
+
+# ------------------------------
+# EMA Implementation
+# ------------------------------
+class EMAState:
+    def __init__(self, params, decay=0.999):
         self.decay = decay
-        # Create shadow weights as float32 copies
-        self.shadow = [tf.Variable(w.read_value(dtype=tf.float32), trainable=False) for w in model.weights]
-        self.backup = None
-
-    @tf.function
-    def update(self, model):
-        for swa, w in zip(self.shadow, model.weights):
-            swa.assign(self.decay * swa + (1.0 - self.decay) * tf.cast(w, tf.float32))
-
-    def apply(self, model):
-        # backup current weights, then load shadow
-        self.backup = [w.read_value() for w in model.weights]
-        for w, swa in zip(model.weights, self.shadow):
-            w.assign(tf.cast(swa, w.dtype))
-
-    def restore(self, model):
-        if self.backup is None:
-            return
-        for w, b in zip(model.weights, self.backup):
-            w.assign(b)
-        self.backup = None
-
-with strategy.scope():
-    ema_G = EMA(netG, decay=0.999)
+        self.shadow = jax.tree_map(lambda x: x.copy(), params)
+    
+    def update(self, params):
+        self.shadow = jax.tree_map(
+            lambda shadow, param: (1 - self.decay) * param + self.decay * shadow,
+            self.shadow, params
+        )
+    
+    def apply(self, state):
+        # Return new state with EMA parameters
+        return state.replace(params=self.shadow)
 
 # ------------------------------
-# Fixed noise for sampling
+# Utility Functions
 # ------------------------------
-def make_fixed_noise(n=64, nz=NZ, seed=42):
-    rng = tf.random.Generator.from_seed(seed)
-    return rng.normal([n, nz])
-
-fixed_noise = make_fixed_noise(64, NZ)
-
-# ------------------------------
-# Loss functions
-# ------------------------------
-def d_loss_fn(real_logits, fake_logits):
-    # label smoothing on real
-    real_labels = tf.ones_like(real_logits) * LABEL_SMOOTH
-    fake_labels = tf.zeros_like(fake_logits)
-
-    # Optional: tiny randomization (comment out if you want exact smoothing only)
-    # real_labels += tf.random.uniform(tf.shape(real_labels), 0.0, 0.05)
-    # fake_labels += tf.random.uniform(tf.shape(fake_labels), 0.0, 0.05)
-
-    real_loss = bce(real_labels, real_logits)
-    fake_loss = bce(fake_labels, fake_logits)
-    loss = (real_loss + fake_loss) * 0.5
-    return tf.nn.compute_average_loss(loss, global_batch_size=BATCH_SIZE)
-
-def g_loss_fn(fake_logits):
-    target = tf.ones_like(fake_logits) * LABEL_SMOOTH
-    loss = bce(target, fake_logits)
-    return tf.nn.compute_average_loss(loss, global_batch_size=BATCH_SIZE)
-
-# ------------------------------
-# Checkpointing (resume supported)
-# ------------------------------
-ckpt = tf.train.Checkpoint(
-    netG=netG, netD=netD, optG=optG, optD=optD,
-    # store EMA shadow as separate variables collection
-    ema_vars=ema_G.shadow
-)
-manager = tf.train.CheckpointManager(ckpt, CHECKPOINT_DIR, max_to_keep=3)
-
-start_epoch = 0
-if manager.latest_checkpoint:
-    ckpt.restore(manager.latest_checkpoint).expect_partial()
-    # try to parse epoch index from a sidecar file
-    epoch_file = os.path.join(CHECKPOINT_DIR, "epoch.txt")
-    if os.path.exists(epoch_file):
-        with open(epoch_file, "r") as f:
-            start_epoch = int(f.read().strip()) + 1
-    print(f"Resumed from: {manager.latest_checkpoint}, start_epoch={start_epoch}")
-
-# ------------------------------
-# Per-replica training step (TPU)
-# ------------------------------
-@tf.function
-def train_step(dist_batch):
-    def step_fn(real_imgs):
-        batch_size = tf.shape(real_imgs)[0]
-        z = tf.random.normal([batch_size, NZ])
-
-        # --- Train D ---
-        with tf.GradientTape() as tapeD:
-            fake_imgs = netG(z, training=True)
-            real_logits = netD(real_imgs, training=True)
-            fake_logits = netD(fake_imgs, training=True)
-            d_loss = d_loss_fn(real_logits, fake_logits)
-        gradsD = tapeD.gradient(d_loss, netD.trainable_variables)
-        optD.apply_gradients(zip(gradsD, netD.trainable_variables))
-
-        # --- Train G ---
-        z2 = tf.random.normal([batch_size, NZ])
-        with tf.GradientTape() as tapeG:
-            fake_imgs2 = netG(z2, training=True)
-            fake_logits2 = netD(fake_imgs2, training=True)
-            g_loss = g_loss_fn(fake_logits2)
-        gradsG = tapeG.gradient(g_loss, netG.trainable_variables)
-        optG.apply_gradients(zip(gradsG, netG.trainable_variables))
-
-        return d_loss, g_loss
-
-    d_loss, g_loss = strategy.run(step_fn, args=(dist_batch,))
-    # reduce across replicas
-    d_loss = strategy.reduce(tf.distribute.ReduceOp.SUM, d_loss, axis=None)
-    g_loss = strategy.reduce(tf.distribute.ReduceOp.SUM, g_loss, axis=None)
-
-    # EMA update (do once per global step)
-    ema_G.update(netG)
-    return d_loss, g_loss
-
-# ------------------------------
-# Sampling utils
-# ------------------------------
-def make_grid(imgs, nrow=8):
-    """imgs: [N, H, W, 3] in [-1,1]; returns H', W', 3 float32 in [0,1]"""
-    imgs = (imgs + 1.0) * 0.5
-    imgs = tf.clip_by_value(imgs, 0.0, 1.0)
-    N, H, W, C = imgs.shape
-    nrow = nrow
-    ncol = math.ceil(N / nrow)
-    grid = tf.zeros([ncol*H, nrow*W, C], dtype=tf.float32)
-    for idx in range(N):
-        r = idx // nrow
-        c = idx % nrow
-        grid[r*H:(r+1)*H, c*W:(c+1)*W, :].assign(imgs[idx])
-    return grid.numpy()
-
-def save_samples(epoch, noise=fixed_noise, use_ema=True):
-    if use_ema:
-        ema_G.apply(netG)
-    imgs = netG(noise, training=False).numpy()
-    if use_ema:
-        ema_G.restore(netG)
-    grid = make_grid(imgs, nrow=8)
-    plt.figure(figsize=(8,8))
-    plt.axis('off')
-    plt.title(f"Generated Samples - Epoch {epoch}")
+def save_image_grid(images, filename, nrow=8):
+    """Save a grid of images"""
+    images = np.array(images)
+    images = (images + 1) / 2  # Denormalize from [-1, 1] to [0, 1]
+    images = np.clip(images, 0, 1)
+    
+    batch_size, h, w, c = images.shape
+    ncol = int(np.ceil(batch_size / nrow))
+    
+    grid = np.zeros((nrow * h, ncol * w, c))
+    for i in range(batch_size):
+        row = i // ncol
+        col = i % ncol
+        if row < nrow:
+            grid[row*h:(row+1)*h, col*w:(col+1)*w] = images[i]
+    
+    plt.figure(figsize=(10, 10))
     plt.imshow(grid)
-    out_path = f"{CHECKPOINT_DIR}/samples_epoch_{epoch}.png"
-    plt.savefig(out_path, bbox_inches='tight', pad_inches=0)
+    plt.axis('off')
+    plt.savefig(filename, bbox_inches='tight', dpi=150)
     plt.close()
-    print("Saved:", out_path)
 
 # ------------------------------
-# Training loop
+# Initialize Everything
 # ------------------------------
+# Initialize random keys
+rng = random.PRNGKey(42)
+rng, init_rng_g, init_rng_d = random.split(rng, 3)
+
+# Create models
+generator = Generator()
+discriminator = Discriminator()
+
+# Create training states
+g_state = create_train_state(init_rng_g, LR, generator, (1, NZ, 1, 1))
+d_state = create_train_state(init_rng_d, LR * 0.5, discriminator, (1, IMAGE_SIZE, IMAGE_SIZE, NC))
+
+# Create EMA for generator
+ema_g = EMAState(g_state.params)
+
+# Fixed noise for visualization
+fixed_noise = random.normal(random.PRNGKey(123), (64, NZ, 1, 1))
+fixed_noise = device_put(fixed_noise)  # Move to TPU
+
+print(f"Generator parameters: {sum(x.size for x in jax.tree_leaves(g_state.params)):,}")
+print(f"Discriminator parameters: {sum(x.size for x in jax.tree_leaves(d_state.params)):,}")
+
+# Training tracking
 G_losses, D_losses = [], []
 
-print("Starting training…")
-for epoch in range(start_epoch, NUM_EPOCHS):
-    t0 = time.time()
-    d_running, g_running, n_steps = 0.0, 0.0, 0
+# Move dataset to TPU
+dataset = device_put(dataset)
 
-    for batch in dist_ds:
-        d_loss, g_loss = train_step(batch)
-        d_running += float(d_loss)
-        g_running += float(g_loss)
-        n_steps += 1
-        # Optional: print every ~50 steps
-        if n_steps % 50 == 0:
-            print(f"Epoch {epoch+1}/{NUM_EPOCHS} Step {n_steps}  D:{d_loss:.4f}  G:{g_loss:.4f}")
+# ------------------------------
+# Training Loop
+# ------------------------------
+print("Starting training...")
 
-    avg_d = d_running / n_steps
-    avg_g = g_running / n_steps
-    D_losses.append(avg_d); G_losses.append(avg_g)
-
-    # Save checkpoint
-    save_path = manager.save()
-    with open(os.path.join(CHECKPOINT_DIR, "epoch.txt"), "w") as f:
-        f.write(str(epoch))
-    print(f"[Epoch {epoch+1}] D_loss={avg_d:.4f} G_loss={avg_g:.4f} | ckpt: {save_path} | time: {time.time()-t0:.1f}s")
-
-    # Sampling
-    if (epoch + 1) % SAMPLE_EVERY_EPOCHS == 0:
-        save_samples(epoch+1, fixed_noise, use_ema=True)
+for epoch in range(NUM_EPOCHS):
+    epoch_G_loss = 0
+    epoch_D_loss = 0
+    
+    # Calculate number of batches
+    num_batches = len(dataset) // BATCH_SIZE
+    
+    for i in range(num_batches):
+        # Get batch
+        rng, batch_rng = random.split(rng)
+        real_batch = get_batch(dataset, BATCH_SIZE, batch_rng)
+        real_batch = device_put(real_batch)
+        
+        # Train discriminator
+        rng, d_rng = random.split(rng)
+        d_state, d_loss = train_discriminator_step(d_state, g_state, real_batch, d_rng)
+        
+        # Train generator
+        rng, g_rng = random.split(rng)
+        g_state, g_loss = train_generator_step(g_state, d_state, g_rng)
+        
+        # Update EMA
+        ema_g.update(g_state.params)
+        
+        # Track losses
+        epoch_G_loss += float(g_loss)
+        epoch_D_loss += float(d_loss)
+        
+        # Print progress
+        if i % 50 == 0:
+            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] Batch [{i}/{num_batches}] "
+                  f"D_loss: {float(d_loss):.4f} G_loss: {float(g_loss):.4f}")
+    
+    # Average losses
+    avg_G_loss = epoch_G_loss / num_batches
+    avg_D_loss = epoch_D_loss / num_batches
+    G_losses.append(avg_G_loss)
+    D_losses.append(avg_D_loss)
+    
+    print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] G_loss: {avg_G_loss:.4f} D_loss: {avg_D_loss:.4f}")
+    
+    # Generate samples every 10 epochs
+    if (epoch + 1) % 10 == 0:
+        # Use EMA weights for better samples
+        ema_state = ema_g.apply(g_state)
+        fake_samples = generate_samples(ema_state, fixed_noise)
+        fake_samples = np.array(fake_samples)
+        
+        # Save samples
+        save_image_grid(fake_samples, f"{CHECKPOINT_DIR}/samples_epoch_{epoch+1}.png")
+        
+        # Display samples
+        plt.figure(figsize=(8, 8))
+        sample_grid = fake_samples[:64]  # Take first 64 samples
+        sample_grid = (sample_grid + 1) / 2  # Denormalize
+        sample_grid = np.clip(sample_grid, 0, 1)
+        
+        # Create grid manually for display
+        grid_size = 8
+        fig, axes = plt.subplots(grid_size, grid_size, figsize=(12, 12))
+        for i in range(grid_size):
+            for j in range(grid_size):
+                idx = i * grid_size + j
+                if idx < len(sample_grid):
+                    axes[i, j].imshow(sample_grid[idx])
+                axes[i, j].axis('off')
+        
+        plt.suptitle(f"Generated Samples - Epoch {epoch+1}")
+        plt.tight_layout()
+        plt.show()
 
 print("Training completed!")
 
-# ------------------------------
-# Save final EMA generator + curves
-# ------------------------------
-# Save EMA weights into the actual model, export, then restore
-ema_G.apply(netG)
-final_gen_path = os.path.join(CHECKPOINT_DIR, "generator_final_ema")
-tf.saved_model.save(netG, final_gen_path)
-ema_G.restore(netG)
-print("Saved EMA Generator to:", final_gen_path)
+# Plot training curves
+if G_losses:
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(G_losses, label='Generator Loss')
+    plt.plot(D_losses, label='Discriminator Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training Losses')
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    # Generate final samples with EMA
+    ema_state = ema_g.apply(g_state)
+    final_samples = generate_samples(ema_state, fixed_noise)
+    final_samples = np.array(final_samples)
+    final_samples = (final_samples + 1) / 2
+    final_samples = np.clip(final_samples, 0, 1)
+    
+    # Show a few final samples
+    for i in range(min(16, len(final_samples))):
+        plt.subplot(4, 4, i+1)
+        plt.imshow(final_samples[i])
+        plt.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(f"{CHECKPOINT_DIR}/training_summary.png")
+    plt.show()
 
-# Plot curves + final grid
-plt.figure(figsize=(12,4))
-plt.subplot(1,2,1)
-plt.plot(G_losses, label='G loss')
-plt.plot(D_losses, label='D loss')
-plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.grid(True); plt.legend(); plt.title('Training Losses')
+print(f"Training completed! Samples saved in {CHECKPOINT_DIR}/")
 
-# final grid
-ema_G.apply(netG)
-final_imgs = netG(fixed_noise, training=False).numpy()
-ema_G.restore(netG)
-grid = make_grid(final_imgs, nrow=8)
-plt.subplot(1,2,2)
-plt.axis('off'); plt.title('Final Generated Samples')
-plt.imshow(grid)
-plt.tight_layout()
-plt.savefig(f"{CHECKPOINT_DIR}/training_summary.png", bbox_inches='tight', pad_inches=0)
-plt.show()
-
-print("Summary saved to:", f"{CHECKPOINT_DIR}/training_summary.png")
+# Save final model parameters
+np.savez(f"{CHECKPOINT_DIR}/generator_final.npz", **ema_g.shadow)
+print(f"Final EMA model saved to {CHECKPOINT_DIR}/generator_final.npz")
