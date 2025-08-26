@@ -1,300 +1,413 @@
-# 🚀 Enhanced Balanced DCGAN (64x64) - Fast + Stable on Colab T4
-!pip install torch torchvision matplotlib --quiet
-
-import os, glob
+import os
+import glob
+import random
+import numpy as np
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, utils
-from torch.cuda.amp import GradScaler, autocast
-from PIL import Image
 import matplotlib.pyplot as plt
+from copy import deepcopy
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# ------------------------------
+# Config
+# ------------------------------
+image_size = 64   # training resolution
+nz = 100          # latent dim
+ngf = 64
+ndf = 64
+nc = 3
+batch_size = 64
+num_epochs = 50
+lr = 0.0002
+beta1 = 0.5
+beta2 = 0.999
+checkpoint_dir = "./checkpoints"
+dataset_path = "./dataset"   # <--- Tweak this path
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# ----------------------
-# Config
-# ----------------------
-data_path = "/content/imagen/Logos"   # 👈 your folder with 1400 imgs
-latent_dim = 100
-batch_size = 64
-epochs = 50
-lr_g = 0.0002  # Slightly different learning rates can help
-lr_d = 0.0002
-beta1, beta2 = 0.5, 0.999
-image_size = 64
-checkpoint_file = "dcgan_checkpoint.pth"
+os.makedirs(checkpoint_dir, exist_ok=True)
 
-# ----------------------
-# Dataset loader (cache into RAM)
-# ----------------------
-class FlatImageDataset(Dataset):
+# ------------------------------
+# RAM-based Dataset with uint8
+# ------------------------------
+class RAMImageDataset(Dataset):
     def __init__(self, root, transform=None):
-        self.files = glob.glob(os.path.join(root, "*.jpg")) + \
-                    glob.glob(os.path.join(root, "*.png")) + \
-                    glob.glob(os.path.join(root, "*.jpeg"))
         self.transform = transform
-        print(f"Found {len(self.files)} images")
+        self.data = []
         
-        # preload all images in memory
-        self.images = []
-        for i, f in enumerate(self.files):
+        # Find all image files
+        files = glob.glob(os.path.join(root, "*.jpg")) + \
+                glob.glob(os.path.join(root, "*.png")) + \
+                glob.glob(os.path.join(root, "*.jpeg"))
+        
+        print(f"Found {len(files)} images in {root}")
+        print("Loading images to RAM as uint8...")
+        
+        # Load all images to RAM as uint8
+        for i, file_path in enumerate(files):
             try:
-                img = Image.open(f).convert("RGB")
-                self.images.append(img)
-                if (i + 1) % 100 == 0:
-                    print(f"Loaded {i+1}/{len(self.files)} images")
+                # Load and resize image
+                img = Image.open(file_path).convert("RGB")
+                img = img.resize((image_size, image_size), Image.Resampling.LANCZOS)
+                
+                # Convert to numpy array (uint8) and store
+                img_array = np.array(img, dtype=np.uint8)  # Shape: (H, W, 3)
+                self.data.append(img_array)
+                
+                # Progress indicator
+                if (i + 1) % 100 == 0 or (i + 1) == len(files):
+                    print(f"Loaded {i + 1}/{len(files)} images to RAM")
+                    
             except Exception as e:
-                print(f"Error loading {f}: {e}")
+                print(f"Error loading {file_path}: {e}")
+                continue
         
-        print(f"Successfully loaded {len(self.images)} images into memory")
+        print(f"Successfully loaded {len(self.data)} images to RAM")
+        
+        # Calculate memory usage
+        if len(self.data) > 0:
+            single_img_size = self.data[0].nbytes
+            total_memory = len(self.data) * single_img_size
+            print(f"Dataset memory usage: {total_memory / (1024**2):.1f} MB ({total_memory / (1024**3):.2f} GB)")
 
-    def __len__(self): return len(self.images)
+    def __len__(self):
+        return len(self.data)
 
     def __getitem__(self, idx):
-        img = self.images[idx]
-        if self.transform: img = self.transform(img)
-        return img, 0
+        # Get uint8 image data
+        img_array = self.data[idx]
+        
+        # Convert to PIL Image for transforms
+        img = Image.fromarray(img_array)
+        
+        # Apply transforms
+        if self.transform:
+            img = self.transform(img)
+            
+        return img
 
+# Transform that works with pre-resized images
 transform = transforms.Compose([
-    transforms.Resize((image_size, image_size)),  # More explicit resize
-    transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3)
+    transforms.CenterCrop(image_size),  # Center crop in case of slight size differences
+    transforms.ToTensor(),              # Converts to float32 and scales to [0,1]
+    transforms.Normalize([0.5]*3, [0.5]*3)  # Normalize to [-1,1]
 ])
 
-dataset = FlatImageDataset(data_path, transform=transform)
-loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
-                   num_workers=2, pin_memory=True, persistent_workers=True)
+# Use the RAM dataset
+dataset = RAMImageDataset(dataset_path, transform)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
-# ----------------------
-# Models with slight improvements
-# ----------------------
-def weights_init(m):
-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-        nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
-
+# ------------------------------
+# Models
+# ------------------------------
 class Generator(nn.Module):
-    def __init__(self, nz, ngf, nc):
+    def __init__(self):
         super().__init__()
         self.main = nn.Sequential(
-            # Input: nz x 1 x 1
             nn.ConvTranspose2d(nz, ngf*8, 4, 1, 0, bias=False),
-            nn.BatchNorm2d(ngf*8),  # BatchNorm can work well for generator
+            nn.BatchNorm2d(ngf*8),
             nn.ReLU(True),
-            # State: (ngf*8) x 4 x 4
+
             nn.ConvTranspose2d(ngf*8, ngf*4, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf*4),
             nn.ReLU(True),
-            # State: (ngf*4) x 8 x 8
+
             nn.ConvTranspose2d(ngf*4, ngf*2, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf*2),
             nn.ReLU(True),
-            # State: (ngf*2) x 16 x 16
+
             nn.ConvTranspose2d(ngf*2, ngf, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf),
             nn.ReLU(True),
-            # State: (ngf) x 32 x 32
+
             nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
             nn.Tanh()
-            # Output: nc x 64 x 64
         )
+
     def forward(self, x): return self.main(x)
 
 class Discriminator(nn.Module):
-    def __init__(self, nc, ndf):
+    def __init__(self):
         super().__init__()
         self.main = nn.Sequential(
-            # Input: nc x 64 x 64
-            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            # Apply spectral norm to all Conv2d layers
+            nn.utils.spectral_norm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
-            # State: ndf x 32 x 32
-            nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False),
-            nn.InstanceNorm2d(ndf*2),
+
+            nn.utils.spectral_norm(nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False)),
+            nn.InstanceNorm2d(ndf*2, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
-            # State: (ndf*2) x 16 x 16
-            nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False),
-            nn.InstanceNorm2d(ndf*4),
+
+            nn.utils.spectral_norm(nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False)),
+            nn.InstanceNorm2d(ndf*4, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
-            # State: (ndf*4) x 8 x 8
-            nn.Conv2d(ndf*4, ndf*8, 4, 2, 1, bias=False),
-            nn.InstanceNorm2d(ndf*8),
+
+            nn.utils.spectral_norm(nn.Conv2d(ndf*4, ndf*8, 4, 2, 1, bias=False)),
+            nn.InstanceNorm2d(ndf*8, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
-            # State: (ndf*8) x 4 x 4
-            nn.Conv2d(ndf*8, 1, 4, 1, 0, bias=False)
-            # Output: 1 x 1 x 1 (logits)
+
+            nn.utils.spectral_norm(nn.Conv2d(ndf*8, 1, 4, 1, 0, bias=False))
+            # Removed Sigmoid - will use BCEWithLogitsLoss instead
         )
-    def forward(self, x): return self.main(x)
 
-# ----------------------
-# Init models + optims
-# ----------------------
-nz, ngf, ndf, nc = latent_dim, 64, 64, 3
-G = Generator(nz, ngf, nc).to(device)
-D = Discriminator(nc, ndf).to(device)
+    def forward(self, x): return self.main(x).view(-1)
 
-# Apply memory format optimization
-G = G.to(memory_format=torch.channels_last)
-D = D.to(memory_format=torch.channels_last)
+# ------------------------------
+# EMA Helper Class
+# ------------------------------
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        
+        # Initialize shadow weights
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+    
+    def restore(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
 
-G.apply(weights_init)
-D.apply(weights_init)
+# ------------------------------
+# Init
+# ------------------------------
+def weights_init(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+        if m.weight is not None: nn.init.normal_(m.weight.data, 1.0, 0.02)
+        if m.bias is not None: nn.init.zeros_(m.bias)
+
+netG, netD = Generator().to(device), Discriminator().to(device)
+netG.apply(weights_init)
+netD.apply(weights_init)
+
+# Initialize EMA for generator
+ema_G = EMA(netG, decay=0.999)
 
 # Print model info
-total_params_G = sum(p.numel() for p in G.parameters())
-total_params_D = sum(p.numel() for p in D.parameters())
+total_params_G = sum(p.numel() for p in netG.parameters())
+total_params_D = sum(p.numel() for p in netD.parameters())
 print(f"Generator parameters: {total_params_G:,}")
 print(f"Discriminator parameters: {total_params_D:,}")
+print("✅ Applied Spectral Normalization to Discriminator")
+print("✅ Initialized EMA for Generator")
 
+# Use BCEWithLogitsLoss for numerical stability
 criterion = nn.BCEWithLogitsLoss()
-optD = optim.Adam(D.parameters(), lr=lr_d, betas=(beta1, beta2))
-optG = optim.Adam(G.parameters(), lr=lr_g, betas=(beta1, beta2))
+optG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, beta2))
+optD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, beta2))
 
-# Learning rate schedulers for stability
-schedulerD = optim.lr_scheduler.StepLR(optD, step_size=20, gamma=0.5)
 schedulerG = optim.lr_scheduler.StepLR(optG, step_size=20, gamma=0.5)
+schedulerD = optim.lr_scheduler.StepLR(optD, step_size=20, gamma=0.5)
 
-scaler = GradScaler()
+fixed_noise = torch.randn(64, nz, 1, 1, device=device)
 
-# Resume from checkpoint
+scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+G_losses, D_losses = [], []
 start_epoch = 0
-if os.path.exists(checkpoint_file):
-    checkpoint = torch.load(checkpoint_file, map_location=device)
-    G.load_state_dict(checkpoint['G'])
-    D.load_state_dict(checkpoint['D'])
+
+# Resume
+ckpt_path = os.path.join(checkpoint_dir, "last.pth")
+if os.path.exists(ckpt_path):
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    netG.load_state_dict(checkpoint['netG'])
+    netD.load_state_dict(checkpoint['netD'])
     optG.load_state_dict(checkpoint['optG'])
     optD.load_state_dict(checkpoint['optD'])
+    schedulerG.load_state_dict(checkpoint['schedulerG'])
+    schedulerD.load_state_dict(checkpoint['schedulerD'])
+    G_losses = checkpoint['G_losses']
+    D_losses = checkpoint['D_losses']
     start_epoch = checkpoint['epoch'] + 1
-    print(f"✅ Resumed from checkpoint at epoch {start_epoch}")
+    
+    # Load EMA state if available
+    if 'ema_shadow' in checkpoint:
+        ema_G.shadow = checkpoint['ema_shadow']
+        print("✅ Loaded EMA weights from checkpoint")
+    else:
+        # Reinitialize EMA if not in checkpoint (backward compatibility)
+        ema_G = EMA(netG, decay=0.999)
+        print("⚠️ EMA weights not found in checkpoint, reinitializing")
+    
+    print(f"Resumed from epoch {start_epoch}")
 
-# ----------------------
-# Training loop with improvements
-# ----------------------
-os.makedirs("samples", exist_ok=True)
-
-# Fixed noise for consistent sample generation
-fixed_noise = torch.randn(16, nz, 1, 1, device=device)
-
-# Loss tracking
-G_losses = []
-D_losses = []
-
-print(f"Starting training from epoch {start_epoch + 1}")
-
-for epoch in range(start_epoch, epochs):
-    epoch_G_loss = 0
+# ------------------------------
+# Train
+# ------------------------------
+print("Starting training...")
+for epoch in range(start_epoch, num_epochs):
     epoch_D_loss = 0
+    epoch_G_loss = 0
     num_batches = 0
     
-    for i, (real, _) in enumerate(loader):
-        real = real.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    for i, real in enumerate(dataloader):
+        real = real.to(device, non_blocking=True)
         b_size = real.size(0)
 
-        # Create labels with label smoothing for stability
-        label_real = torch.ones(b_size, device=device) * 0.9  # Label smoothing
+        # Labels (using ones_like/zeros_like for proper tensor creation)
+        label_real = torch.ones(b_size, device=device)
         label_fake = torch.zeros(b_size, device=device)
 
-        # ----------------------
-        # Train Discriminator
-        # ----------------------
-        D.zero_grad(set_to_none=True)
-        with autocast():
-            # Train on real images
-            out_real = D(real).view(-1)
-            lossD_real = criterion(out_real, label_real)
-
-            # Train on fake images
-            noise = torch.randn(b_size, nz, 1, 1, device=device)
-            fake = G(noise)
-            out_fake = D(fake.detach()).view(-1)
-            lossD_fake = criterion(out_fake, label_fake)
+        # ---------------- D ----------------
+        netD.zero_grad(set_to_none=True)
+        
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                out_real = netD(real)
+                loss_real = criterion(out_real, label_real * 0.9)  # label smoothing
+                
+                noise = torch.randn(b_size, nz, 1, 1, device=device)
+                fake = netG(noise)
+                out_fake = netD(fake.detach())
+                loss_fake = criterion(out_fake, label_fake)
+                lossD = (loss_real + loss_fake) / 2  # Average the losses
             
-            lossD = (lossD_real + lossD_fake) / 2  # Average the losses
-        
-        scaler.scale(lossD).backward()
-        scaler.step(optD)
-        scaler.update()
+            scaler.scale(lossD).backward()
+            scaler.unscale_(optD)  # Unscale before clipping
+            torch.nn.utils.clip_grad_norm_(netD.parameters(), 1.0)
+            scaler.step(optD)
+        else:
+            out_real = netD(real)
+            loss_real = criterion(out_real, label_real * 0.9)
+            
+            noise = torch.randn(b_size, nz, 1, 1, device=device)
+            fake = netG(noise)
+            out_fake = netD(fake.detach())
+            loss_fake = criterion(out_fake, label_fake)
+            lossD = (loss_real + loss_fake) / 2
+            
+            lossD.backward()
+            torch.nn.utils.clip_grad_norm_(netD.parameters(), 1.0)
+            optD.step()
 
-        # ----------------------
-        # Train Generator
-        # ----------------------
-        G.zero_grad(set_to_none=True)
-        with autocast():
-            # Generator wants discriminator to think fake images are real
-            out = D(fake).view(-1)
-            lossG = criterion(out, torch.ones(b_size, device=device))  # Use hard labels for G
+        # ---------------- G ----------------
+        netG.zero_grad(set_to_none=True)
         
-        scaler.scale(lossG).backward()
-        scaler.step(optG)
-        scaler.update()
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                out = netD(fake)
+                lossG = criterion(out, label_real)  # G wants D to think fake is real
+            
+            scaler.scale(lossG).backward()
+            scaler.step(optG)
+            scaler.update()
+        else:
+            out = netD(fake)
+            lossG = criterion(out, label_real)
+            
+            lossG.backward()
+            optG.step()
 
-        epoch_G_loss += lossG.item()
         epoch_D_loss += lossD.item()
+        epoch_G_loss += lossG.item()
         num_batches += 1
+        
+        # Update EMA after each generator update
+        ema_G.update(netG)
 
-        # Print progress every 10 batches
-        if (i + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{epochs}] Batch [{i+1}/{len(loader)}] "
-                  f"D Loss: {lossD.item():.4f} G Loss: {lossG.item():.4f}")
-
-    # Update learning rate schedulers
-    schedulerD.step()
-    schedulerG.step()
-    
     # Calculate average losses for the epoch
-    avg_G_loss = epoch_G_loss / num_batches
     avg_D_loss = epoch_D_loss / num_batches
-    G_losses.append(avg_G_loss)
+    avg_G_loss = epoch_G_loss / num_batches
     D_losses.append(avg_D_loss)
+    G_losses.append(avg_G_loss)
 
-    print(f"✅ Epoch [{epoch+1}/{epochs}] Complete - "
-          f"Avg D Loss: {avg_D_loss:.4f}, Avg G Loss: {avg_G_loss:.4f}")
+    schedulerG.step()
+    schedulerD.step()
 
-    # Generate and save sample images
-    with torch.no_grad():
-        fake_samples = G(fixed_noise).detach().cpu()
-        utils.save_image(fake_samples, f"samples/fake_epoch_{epoch+1:03d}.png", 
-                        normalize=True, nrow=4, padding=2)
+    print(f"Epoch [{epoch+1}/{num_epochs}] D Loss: {avg_D_loss:.4f} G Loss: {avg_G_loss:.4f}")
 
-    # Save checkpoint every epoch
+    # Save checkpoint (including EMA state)
     torch.save({
-        'epoch': epoch,
-        'G': G.state_dict(),
-        'D': D.state_dict(),
-        'optG': optG.state_dict(),
-        'optD': optD.state_dict(),
-        'schedulerG': schedulerG.state_dict(),
-        'schedulerD': schedulerD.state_dict(),
-        'G_losses': G_losses,
-        'D_losses': D_losses
-    }, checkpoint_file)
+        "epoch": epoch,
+        "netG": netG.state_dict(),
+        "netD": netD.state_dict(),
+        "optG": optG.state_dict(),
+        "optD": optD.state_dict(),
+        "schedulerG": schedulerG.state_dict(),
+        "schedulerD": schedulerD.state_dict(),
+        "G_losses": G_losses,
+        "D_losses": D_losses,
+        "ema_shadow": ema_G.shadow  # Save EMA weights
+    }, ckpt_path)
 
-    # Plot loss curves every 5 epochs
+    # Preview every 5 epochs to avoid cluttering output
     if (epoch + 1) % 5 == 0:
-        plt.figure(figsize=(10, 5))
-        plt.plot(G_losses, label='Generator Loss')
-        plt.plot(D_losses, label='Discriminator Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.title('GAN Training Losses')
-        plt.grid(True)
-        plt.savefig(f'samples/losses_epoch_{epoch+1:03d}.png')
-        plt.close()
+        # Use EMA weights for sample generation
+        ema_G.apply_shadow(netG)
+        with torch.no_grad():
+            fake = netG(fixed_noise).detach().cpu()
+        ema_G.restore(netG)  # Restore original weights
+        
+        grid = utils.make_grid(fake, padding=2, normalize=True)
+        plt.figure(figsize=(8,8))
+        plt.axis("off")
+        plt.title(f"Epoch {epoch+1} (EMA Generator)")
+        plt.imshow(np.transpose(grid,(1,2,0)))
+        plt.show()
+        
+        # Also save to file
+        utils.save_image(fake, f"{checkpoint_dir}/samples_epoch_{epoch+1:03d}_ema.png", 
+                        normalize=True, nrow=8, padding=2)
 
-print("🎉 Training complete!")
+print("Training completed!")
 
-# Generate final sample grid
-print("Generating final samples...")
-with torch.no_grad():
-    # Generate a larger grid of samples
-    final_noise = torch.randn(64, nz, 1, 1, device=device)
-    final_samples = G(final_noise).detach().cpu()
-    utils.save_image(final_samples, "samples/final_samples.png", 
-                    normalize=True, nrow=8, padding=2)
-
-print("✅ Final samples saved to samples/final_samples.png")
+# Plot final loss curves
+if len(G_losses) > 0:
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(G_losses, label='Generator Loss')
+    plt.plot(D_losses, label='Discriminator Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training Losses')
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    # Generate final samples using EMA weights
+    ema_G.apply_shadow(netG)
+    with torch.no_grad():
+        final_samples = netG(fixed_noise).detach().cpu()
+    ema_G.restore(netG)
+    
+    final_grid = utils.make_grid(final_samples, padding=2, normalize=True)
+    plt.axis("off")
+    plt.title("Final Generated Samples (EMA)")
+    plt.imshow(np.transpose(final_grid,(1,2,0)))
+    
+    plt.tight_layout()
+    plt.savefig(f"{checkpoint_dir}/training_summary.png", dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Save final EMA model separately
+    ema_G.apply_shadow(netG)
+    torch.save(netG.state_dict(), f"{checkpoint_dir}/generator_ema_final.pth")
+    ema_G.restore(netG)
+    print(f"✅ Final EMA generator saved to {checkpoint_dir}/generator_ema_final.pth")
