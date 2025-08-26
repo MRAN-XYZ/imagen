@@ -383,7 +383,7 @@ for epoch in range(start_epoch, num_epochs):
         if i % 50 == 0:
             print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{i}/{len(dataloader)}]")
             print(f"D real confidence: {D_real_prob:.3f}, D fake confidence: {D_fake_prob:.3f}")
-            print(f"D accuracy: {(D_real_prob > 0.5).float().mean().item():.3f}")
+            print(f"D accuracy: {((D_real_prob > 0.5).astype(float) + (D_fake_prob < 0.5).astype(float)) / 2:.3f}")
 
     # Calculate average metrics for the epoch
     avg_D_loss = epoch_D_loss / (num_batches / 2)  # Account for skipping every other update
