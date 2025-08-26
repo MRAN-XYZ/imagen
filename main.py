@@ -235,7 +235,8 @@ schedulerD = optim.lr_scheduler.StepLR(optD, step_size=20, gamma=0.5)
 
 fixed_noise = torch.randn(64, nz, 1, 1, device=device)
 
-scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+# Updated to use new torch.amp API
+scaler = torch.amp.GradScaler(device.type) if device.type == 'cuda' else None
 G_losses, D_losses = [], []
 D_real_probs, D_fake_probs = [], []  # Track discriminator confidence
 start_epoch = 0
@@ -290,7 +291,7 @@ for epoch in range(start_epoch, num_epochs):
             netD.zero_grad(set_to_none=True)
             
             if scaler is not None:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type=device.type):
                     out_real = netD(real)
                     loss_real = criterion(out_real, label_real)
                     
@@ -351,7 +352,7 @@ for epoch in range(start_epoch, num_epochs):
         netG.zero_grad(set_to_none=True)
         
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type=device.type):
                 out = netD(fake)
                 lossG = criterion(out, label_real)  # G wants D to think fake is real
             
@@ -383,10 +384,12 @@ for epoch in range(start_epoch, num_epochs):
         if i % 50 == 0:
             print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{i}/{len(dataloader)}]")
             print(f"D real confidence: {D_real_prob:.3f}, D fake confidence: {D_fake_prob:.3f}")
-            print(f"D accuracy: {((D_real_prob > 0.5).astype(float) + (D_fake_prob < 0.5).astype(float)) / 2:.3f}")
+            # Fixed accuracy calculation
+            accuracy = (int(D_real_prob > 0.5) + int(D_fake_prob < 0.5)) / 2
+            print(f"D accuracy: {accuracy:.3f}")
 
     # Calculate average metrics for the epoch
-    avg_D_loss = epoch_D_loss / (num_batches / 2)  # Account for skipping every other update
+    avg_D_loss = epoch_D_loss / (num_batches / 2) if (num_batches / 2) > 0 else 0  # Account for skipping every other update
     avg_G_loss = epoch_G_loss / num_batches
     avg_D_real_prob = epoch_D_real_prob / num_batches
     avg_D_fake_prob = epoch_D_fake_prob / num_batches
