@@ -93,6 +93,7 @@ class RAMImageDataset(Dataset):
 
 # Transform that works with pre-resized images
 transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(p=0.3),  # Add data augmentation
     transforms.CenterCrop(image_size),  # Center crop in case of slight size differences
     transforms.ToTensor(),              # Converts to float32 and scales to [0,1]
     transforms.Normalize([0.5]*3, [0.5]*3)  # Normalize to [-1,1]
@@ -109,7 +110,11 @@ class Generator(nn.Module):
     def __init__(self):
         super().__init__()
         self.main = nn.Sequential(
-            nn.ConvTranspose2d(nz, ngf*8, 4, 1, 0, bias=False),
+            nn.ConvTranspose2d(nz, ngf*16, 4, 1, 0, bias=False),  # Increased capacity
+            nn.BatchNorm2d(ngf*16),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf*16, ngf*8, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf*8),
             nn.ReLU(True),
 
@@ -125,7 +130,7 @@ class Generator(nn.Module):
             nn.BatchNorm2d(ngf),
             nn.ReLU(True),
 
-            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            nn.ConvTranspose2d(ngf, nc, 3, 1, 1, bias=False),  # Changed to 3x3 kernel
             nn.Tanh()
         )
 
@@ -136,22 +141,22 @@ class Discriminator(nn.Module):
         super().__init__()
         self.main = nn.Sequential(
             # Apply spectral norm to all Conv2d layers
-            nn.utils.spectral_norm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
+            nn.utils.spectral_norm(nn.Conv2d(nc, ndf//2, 4, 2, 1, bias=False)),  # Reduced capacity
             nn.LeakyReLU(0.2, inplace=True),
 
-            nn.utils.spectral_norm(nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False)),
+            nn.utils.spectral_norm(nn.Conv2d(ndf//2, ndf, 4, 2, 1, bias=False)),  # Reduced
+            nn.InstanceNorm2d(ndf, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.utils.spectral_norm(nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False)),   # Reduced
             nn.InstanceNorm2d(ndf*2, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
 
-            nn.utils.spectral_norm(nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False)),
+            nn.utils.spectral_norm(nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False)), # Reduced
             nn.InstanceNorm2d(ndf*4, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
 
-            nn.utils.spectral_norm(nn.Conv2d(ndf*4, ndf*8, 4, 2, 1, bias=False)),
-            nn.InstanceNorm2d(ndf*8, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.utils.spectral_norm(nn.Conv2d(ndf*8, 1, 4, 1, 0, bias=False))
+            nn.utils.spectral_norm(nn.Conv2d(ndf*4, 1, 4, 1, 0, bias=False))
             # Removed Sigmoid - will use BCEWithLogitsLoss instead
         )
 
@@ -221,8 +226,9 @@ print("✅ Initialized EMA for Generator")
 
 # Use BCEWithLogitsLoss for numerical stability
 criterion = nn.BCEWithLogitsLoss()
-optG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, beta2))
-optD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, beta2))
+# Make generator learn faster than discriminator
+optG = optim.Adam(netG.parameters(), lr=lr*2, betas=(beta1, beta2))  # G learns faster
+optD = optim.Adam(netD.parameters(), lr=lr*0.5, betas=(beta1, beta2))  # D learns slower
 
 schedulerG = optim.lr_scheduler.StepLR(optG, step_size=20, gamma=0.5)
 schedulerD = optim.lr_scheduler.StepLR(optD, step_size=20, gamma=0.5)
@@ -231,6 +237,7 @@ fixed_noise = torch.randn(64, nz, 1, 1, device=device)
 
 scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 G_losses, D_losses = [], []
+D_real_probs, D_fake_probs = [], []  # Track discriminator confidence
 start_epoch = 0
 
 # Resume
@@ -265,47 +272,80 @@ print("Starting training...")
 for epoch in range(start_epoch, num_epochs):
     epoch_D_loss = 0
     epoch_G_loss = 0
+    epoch_D_real_prob = 0
+    epoch_D_fake_prob = 0
     num_batches = 0
     
     for i, real in enumerate(dataloader):
         real = real.to(device, non_blocking=True)
         b_size = real.size(0)
 
-        # Labels (using ones_like/zeros_like for proper tensor creation)
-        label_real = torch.ones(b_size, device=device)
-        label_fake = torch.zeros(b_size, device=device)
+        # Labels with more noise to make discriminator's task harder
+        label_real = torch.ones(b_size, device=device) * (0.7 + 0.3 * torch.rand(b_size, device=device))
+        label_fake = torch.zeros(b_size, device=device) * (0.3 * torch.rand(b_size, device=device))
 
         # ---------------- D ----------------
-        netD.zero_grad(set_to_none=True)
-        
-        if scaler is not None:
-            with torch.cuda.amp.autocast():
-                out_real = netD(real)
-                loss_real = criterion(out_real, label_real * 0.9)  # label smoothing
+        # Train discriminator less frequently (every other iteration)
+        if (i % 2 == 0):  # Only update D every other batch
+            netD.zero_grad(set_to_none=True)
+            
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    out_real = netD(real)
+                    loss_real = criterion(out_real, label_real)
+                    
+                    # Add more noise to latent space
+                    noise = torch.randn(b_size, nz, 1, 1, device=device) * 1.1
+                    fake = netG(noise)
+                    out_fake = netD(fake.detach())
+                    loss_fake = criterion(out_fake, label_fake)
+                    
+                    # Add gradient penalty
+                    alpha = torch.rand(real.size(0), 1, 1, 1, device=device)
+                    interpolated = (alpha * real + (1 - alpha) * fake.detach()).requires_grad_(True)
+                    d_interpolated = netD(interpolated)
+                    gradients = torch.autograd.grad(
+                        outputs=d_interpolated,
+                        inputs=interpolated,
+                        grad_outputs=torch.ones_like(d_interpolated),
+                        create_graph=True,
+                        retain_graph=True,
+                    )[0]
+                    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+                    
+                    lossD = (loss_real + loss_fake) / 2 + 10.0 * gradient_penalty
                 
-                noise = torch.randn(b_size, nz, 1, 1, device=device)
+                scaler.scale(lossD).backward()
+                scaler.unscale_(optD)  # Unscale before clipping
+                torch.nn.utils.clip_grad_norm_(netD.parameters(), 1.0)
+                scaler.step(optD)
+            else:
+                out_real = netD(real)
+                loss_real = criterion(out_real, label_real)
+                
+                noise = torch.randn(b_size, nz, 1, 1, device=device) * 1.1
                 fake = netG(noise)
                 out_fake = netD(fake.detach())
                 loss_fake = criterion(out_fake, label_fake)
-                lossD = (loss_real + loss_fake) / 2  # Average the losses
-            
-            scaler.scale(lossD).backward()
-            scaler.unscale_(optD)  # Unscale before clipping
-            torch.nn.utils.clip_grad_norm_(netD.parameters(), 1.0)
-            scaler.step(optD)
-        else:
-            out_real = netD(real)
-            loss_real = criterion(out_real, label_real * 0.9)
-            
-            noise = torch.randn(b_size, nz, 1, 1, device=device)
-            fake = netG(noise)
-            out_fake = netD(fake.detach())
-            loss_fake = criterion(out_fake, label_fake)
-            lossD = (loss_real + loss_fake) / 2
-            
-            lossD.backward()
-            torch.nn.utils.clip_grad_norm_(netD.parameters(), 1.0)
-            optD.step()
+                
+                # Add gradient penalty
+                alpha = torch.rand(real.size(0), 1, 1, 1, device=device)
+                interpolated = (alpha * real + (1 - alpha) * fake.detach()).requires_grad_(True)
+                d_interpolated = netD(interpolated)
+                gradients = torch.autograd.grad(
+                    outputs=d_interpolated,
+                    inputs=interpolated,
+                    grad_outputs=torch.ones_like(d_interpolated),
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+                gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+                
+                lossD = (loss_real + loss_fake) / 2 + 10.0 * gradient_penalty
+                
+                lossD.backward()
+                torch.nn.utils.clip_grad_norm_(netD.parameters(), 1.0)
+                optD.step()
 
         # ---------------- G ----------------
         netG.zero_grad(set_to_none=True)
@@ -325,23 +365,42 @@ for epoch in range(start_epoch, num_epochs):
             lossG.backward()
             optG.step()
 
-        epoch_D_loss += lossD.item()
-        epoch_G_loss += lossG.item()
-        num_batches += 1
-        
         # Update EMA after each generator update
         ema_G.update(netG)
+        
+        # Calculate metrics
+        with torch.no_grad():
+            D_real_prob = torch.sigmoid(out_real).mean().item()
+            D_fake_prob = torch.sigmoid(out_fake).mean().item()
+            
+        epoch_D_loss += lossD.item() if (i % 2 == 0) else 0
+        epoch_G_loss += lossG.item()
+        epoch_D_real_prob += D_real_prob
+        epoch_D_fake_prob += D_fake_prob
+        num_batches += 1
+        
+        # Print diagnostics every 50 batches
+        if i % 50 == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{i}/{len(dataloader)}]")
+            print(f"D real confidence: {D_real_prob:.3f}, D fake confidence: {D_fake_prob:.3f}")
+            print(f"D accuracy: {(D_real_prob > 0.5).float().mean().item():.3f}")
 
-    # Calculate average losses for the epoch
-    avg_D_loss = epoch_D_loss / num_batches
+    # Calculate average metrics for the epoch
+    avg_D_loss = epoch_D_loss / (num_batches / 2)  # Account for skipping every other update
     avg_G_loss = epoch_G_loss / num_batches
+    avg_D_real_prob = epoch_D_real_prob / num_batches
+    avg_D_fake_prob = epoch_D_fake_prob / num_batches
+    
     D_losses.append(avg_D_loss)
     G_losses.append(avg_G_loss)
+    D_real_probs.append(avg_D_real_prob)
+    D_fake_probs.append(avg_D_fake_prob)
 
     schedulerG.step()
     schedulerD.step()
 
     print(f"Epoch [{epoch+1}/{num_epochs}] D Loss: {avg_D_loss:.4f} G Loss: {avg_G_loss:.4f}")
+    print(f"D real prob: {avg_D_real_prob:.3f}, D fake prob: {avg_D_fake_prob:.3f}")
 
     # Save checkpoint (including EMA state)
     torch.save({
@@ -354,6 +413,8 @@ for epoch in range(start_epoch, num_epochs):
         "schedulerD": schedulerD.state_dict(),
         "G_losses": G_losses,
         "D_losses": D_losses,
+        "D_real_probs": D_real_probs,
+        "D_fake_probs": D_fake_probs,
         "ema_shadow": ema_G.shadow  # Save EMA weights
     }, ckpt_path)
 
@@ -378,10 +439,12 @@ for epoch in range(start_epoch, num_epochs):
 
 print("Training completed!")
 
-# Plot final loss curves
+# Plot final results
 if len(G_losses) > 0:
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(15, 10))
+    
+    # Loss curves
+    plt.subplot(2, 2, 1)
     plt.plot(G_losses, label='Generator Loss')
     plt.plot(D_losses, label='Discriminator Loss')
     plt.xlabel('Epoch')
@@ -390,8 +453,27 @@ if len(G_losses) > 0:
     plt.title('Training Losses')
     plt.grid(True)
     
-    plt.subplot(1, 2, 2)
-    # Generate final samples using EMA weights
+    # Discriminator confidence
+    plt.subplot(2, 2, 2)
+    plt.plot(D_real_probs, label='D Real Confidence')
+    plt.plot(D_fake_probs, label='D Fake Confidence')
+    plt.xlabel('Epoch')
+    plt.ylabel('Probability')
+    plt.legend()
+    plt.title('Discriminator Confidence')
+    plt.grid(True)
+    
+    # D accuracy
+    plt.subplot(2, 2, 3)
+    D_accuracy = [(0.5 * (r > 0.5) + 0.5 * (f < 0.5)) for r, f in zip(D_real_probs, D_fake_probs)]
+    plt.plot(D_accuracy)
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Discriminator Accuracy')
+    plt.grid(True)
+    
+    # Final samples
+    plt.subplot(2, 2, 4)
     ema_G.apply_shadow(netG)
     with torch.no_grad():
         final_samples = netG(fixed_noise).detach().cpu()
