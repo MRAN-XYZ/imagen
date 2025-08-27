@@ -55,7 +55,7 @@ def load_dataset(root_path, image_size=64):
         try:
             img = Image.open(file_path).convert("RGB")
             img = img.resize((image_size, image_size))
-            img_array = np.array(img, dtype=np.float32) / 127.5 - 1.0  # Normalize to [-1, 1]
+            img_array = np.array(img, dtype=np.bfloat16) / 127.5 - 1.0  # Normalize to [-1, 1]
             data.append(img_array)
 
             if (i + 1) % 100 == 0:
