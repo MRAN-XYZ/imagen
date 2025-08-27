@@ -69,9 +69,15 @@ def load_dataset(root_path, image_size=64):
     return data
 
 def get_batch(data, batch_size, rng):
-    """Get a random batch from the dataset"""
-    batch_indices = random.choice(rng, len(data), (batch_size,), replace=False)
-    return data[batch_indices]
+    """Get a random batch from the dataset (convert to bfloat16 here)."""
+    batch_indices = random.choice(rng, data.shape[0], (batch_size,), replace=False)
+    batch = data[batch_indices]  # still uint8
+
+    # ✅ convert to bfloat16 + normalize [-1, 1] on the fly
+    batch = batch.astype(np.bfloat16)
+    batch = (batch / np.bfloat16(127.5)) - np.bfloat16(1.0)
+
+    return batch
 
 # Load dataset
 dataset = load_dataset(DATASET_PATH, IMAGE_SIZE)
