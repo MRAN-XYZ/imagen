@@ -183,27 +183,34 @@ def bce_with_logits_loss(logits, labels):
 
 @jit
 def train_discriminator_step(d_state, g_state, real_batch, rng):
-    """Single discriminator training step"""
     batch_size = real_batch.shape[0]
 
     def d_loss_fn(d_params):
         d_variables = {'params': d_params, 'batch_stats': d_state.batch_stats}
 
-        # Real images loss
-        real_logits, new_d_vars = d_state.apply_fn(d_variables, real_batch, training=True, mutable=['batch_stats'])
-        real_labels = jnp.ones((batch_size, 1)) * 0.9  # Label smoothing
+        # Real images
+        real_logits, vars_after_real = d_state.apply_fn(
+            d_variables, real_batch, training=True, mutable=['batch_stats']
+        )
+        real_labels = jnp.ones((batch_size, 1)) * 0.9
         real_loss = bce_with_logits_loss(real_logits, real_labels)
 
-        # Fake images loss
+        # Fake images
         noise = random.normal(rng, (batch_size, NZ, 1, 1))
         g_variables = {'params': g_state.params, 'batch_stats': g_state.batch_stats}
         fake_batch = g_state.apply_fn(g_variables, noise, training=False)
-        fake_logits, new_d_vars2 = d_state.apply_fn(new_d_vars, fake_batch, training=True, mutable=['batch_stats'])
+
+        fake_logits, vars_after_fake = d_state.apply_fn(
+            {'params': d_params, 'batch_stats': vars_after_real['batch_stats']},
+            fake_batch,
+            training=True,
+            mutable=['batch_stats']
+        )
         fake_labels = jnp.zeros((batch_size, 1))
         fake_loss = bce_with_logits_loss(fake_logits, fake_labels)
 
         loss = (real_loss + fake_loss) / 2
-        return loss, new_d_vars2['batch_stats']
+        return loss, vars_after_fake['batch_stats']
 
     (loss, new_d_batch_stats), grads = value_and_grad(d_loss_fn, has_aux=True)(d_state.params)
     d_state = d_state.apply_gradients(grads=grads)
