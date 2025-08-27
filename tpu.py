@@ -168,7 +168,7 @@ class TrainState(train_state.TrainState):
 
 def create_train_state(rng, learning_rate, model, input_shape):
     """Create initial training state"""
-    variables = model.init(rng, jnp.ones(input_shape), training=False)
+    variables = model.init(rng, jnp.ones(input_shape), training=True)
     tx = optax.adam(learning_rate, b1=BETA1, b2=BETA2)
     return TrainState.create(
         apply_fn=model.apply,
