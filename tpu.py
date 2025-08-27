@@ -138,30 +138,30 @@ class Discriminator(nn.Module):
     def __call__(self, x, training=True):
         # 64x64 -> 32x32
         x = nn.Conv(self.ndf, kernel_size=(4, 4), strides=(2, 2), 
-                   padding='SAME', use_bias=False)(x)
+                   padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
         x = nn.leaky_relu(x, negative_slope=0.2)
 
         # 32x32 -> 16x16
         x = nn.Conv(self.ndf * 2, kernel_size=(4, 4), strides=(2, 2), 
-                   padding='SAME', use_bias=False)(x)
-        x = nn.BatchNorm(use_running_average=not training)(x)
+                   padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
+        x = nn.BatchNorm(use_running_average=not training, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
         x = nn.leaky_relu(x, negative_slope=0.2)
 
         # 16x16 -> 8x8
         x = nn.Conv(self.ndf * 4, kernel_size=(4, 4), strides=(2, 2), 
-                   padding='SAME', use_bias=False)(x)
-        x = nn.BatchNorm(use_running_average=not training)(x)
+                   padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
+        x = nn.BatchNorm(use_running_average=not training, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
         x = nn.leaky_relu(x, negative_slope=0.2)
 
         # 8x8 -> 4x4
         x = nn.Conv(self.ndf * 8, kernel_size=(4, 4), strides=(2, 2), 
-                   padding='SAME', use_bias=False)(x)
-        x = nn.BatchNorm(use_running_average=not training)(x)
+                   padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
+        x = nn.BatchNorm(use_running_average=not training, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
         x = nn.leaky_relu(x, negative_slope=0.2)
 
         # 4x4 -> 1x1
         x = nn.Conv(1, kernel_size=(4, 4), strides=(1, 1), 
-                   padding='VALID', use_bias=False)(x)
+                   padding='VALID', use_bias=False, dtype=jnp.bfloat16)(x)
         x = x.reshape(x.shape[0], -1)  # Flatten
 
         return x
