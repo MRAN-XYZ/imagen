@@ -27,7 +27,7 @@ NDF = 64  # discriminator features
 NC = 3    # color channels
 
 # Training params
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 NUM_EPOCHS = 200
 LR = 0.0002
 BETA1, BETA2 = 0.5, 0.999
