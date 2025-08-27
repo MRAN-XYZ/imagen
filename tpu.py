@@ -95,37 +95,37 @@ class Generator(nn.Module):
 
         # 1x1 -> 4x4
         x = nn.ConvTranspose(self.ngf * 16, kernel_size=(4, 4), strides=(1, 1), 
-                           padding='VALID', use_bias=False)(x)
+                           padding='VALID', use_bias=False, dtype=jnp.bfloat16)(x)
         x = nn.BatchNorm(use_running_average=not training)(x)
         x = nn.relu(x)
 
         # 4x4 -> 8x8
         x = nn.ConvTranspose(self.ngf * 8, kernel_size=(4, 4), strides=(2, 2), 
-                           padding='SAME', use_bias=False)(x)
+                           padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
         x = nn.BatchNorm(use_running_average=not training)(x)
         x = nn.relu(x)
 
         # 8x8 -> 16x16
         x = nn.ConvTranspose(self.ngf * 4, kernel_size=(4, 4), strides=(2, 2), 
-                           padding='SAME', use_bias=False)(x)
+                           padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
         x = nn.BatchNorm(use_running_average=not training)(x)
         x = nn.relu(x)
 
         # 16x16 -> 32x32
         x = nn.ConvTranspose(self.ngf * 2, kernel_size=(4, 4), strides=(2, 2), 
-                           padding='SAME', use_bias=False)(x)
+                           padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
         x = nn.BatchNorm(use_running_average=not training)(x)
         x = nn.relu(x)
 
         # 32x32 -> 64x64
         x = nn.ConvTranspose(self.ngf, kernel_size=(4, 4), strides=(2, 2), 
-                           padding='SAME', use_bias=False)(x)
+                           padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
         x = nn.BatchNorm(use_running_average=not training)(x)
         x = nn.relu(x)
 
         # Final layer
         x = nn.ConvTranspose(self.nc, kernel_size=(3, 3), strides=(1, 1), 
-                           padding='SAME', use_bias=False)(x)
+                           padding='SAME', use_bias=False, dtype=jnp.bfloat16)(x)
         x = nn.tanh(x)
 
         return x
