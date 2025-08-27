@@ -75,7 +75,7 @@ def get_batch(data, batch_size, rng):
 
     # ✅ convert to bfloat16 + normalize [-1, 1] on the fly
     batch = batch.astype(np.bfloat16)
-    batch = (batch / np.bfloat16(127.5)) - np.bfloat16(1.0)
+    batch = (batch / np.bfloat16(127.5)) - jnp.bfloat16(1.0)
 
     return batch
 
